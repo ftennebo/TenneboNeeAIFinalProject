@@ -1,17 +1,13 @@
-import argparse
-import json
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import mean_squared_error
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.model_selection import train_test_split
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
 DATA_DIR = PROJECT_DIR / "data"
-RESULTS_DIR = PROJECT_DIR / "results"
 
 RATINGS_FILE = DATA_DIR / "ratings.csv"
 MOVIES_FILE = DATA_DIR / "movies.csv"
@@ -23,271 +19,274 @@ def load_data():
     return ratings, movies
 
 
-def filter_data(ratings, min_user_ratings=20, min_movie_ratings=20):
-    user_counts = ratings["userId"].value_counts()
-    movie_counts = ratings["movieId"].value_counts()
-
-    filtered = ratings[
-        ratings["userId"].isin(user_counts[user_counts >= min_user_ratings].index)
-    ]
-    filtered = filtered[
-        filtered["movieId"].isin(movie_counts[movie_counts >= min_movie_ratings].index)
-    ]
-
-    return filtered.copy()
-
-
-def train_test_split_ratings(ratings, test_size=0.2, random_state=42):
-    train, test = train_test_split(
-        ratings,
-        test_size=test_size,
-        random_state=random_state,
+def clean_title(title):
+    return (
+        str(title)
+        .lower()
+        .replace(",", " ")
+        .replace(":", " ")
+        .replace("(", " ")
+        .replace(")", " ")
+        .replace("-", " ")
+        .strip()
     )
-    return train.copy(), test.copy()
 
 
-def build_user_movie_matrix(ratings):
-    return ratings.pivot_table(index="userId", columns="movieId", values="rating")
+def prepare_movies(movies, ratings):
+    movies = movies.copy()
+    movies["clean_title"] = movies["title"].apply(clean_title)
+    movies["genres_text"] = movies["genres"].fillna("").str.replace("|", " ", regex=False)
+    movies["content_text"] = movies["clean_title"] + " " + movies["genres_text"]
+
+    rating_summary = ratings.groupby("movieId").agg(
+        avg_rating=("rating", "mean"),
+        rating_count=("rating", "count"),
+    ).reset_index()
+
+    movies = movies.merge(rating_summary, on="movieId", how="left")
+    movies["avg_rating"] = movies["avg_rating"].fillna(ratings["rating"].mean())
+    movies["rating_count"] = movies["rating_count"].fillna(0)
+
+    return movies
 
 
-def evaluate_popularity_baseline(train, test):
-    global_mean = train["rating"].mean()
-    movie_mean = train.groupby("movieId")["rating"].mean()
+def normalize_series(series):
+    series = series.astype(float)
+    min_val = series.min()
+    max_val = series.max()
 
-    preds = []
-    actuals = []
+    if max_val == min_val:
+        return pd.Series(np.ones(len(series)), index=series.index)
 
-    for row in test.itertuples(index=False):
-        pred = movie_mean.get(row.movieId, global_mean)
-        preds.append(pred)
-        actuals.append(row.rating)
-
-    rmse = np.sqrt(mean_squared_error(actuals, preds))
-    return rmse, movie_mean, global_mean
+    return (series - min_val) / (max_val - min_val)
 
 
-def build_item_similarity_matrix(user_movie_matrix):
-    filled = user_movie_matrix.fillna(0)
-    similarity = cosine_similarity(filled.T)
+def build_similarity_data(movies):
+    vectorizer = TfidfVectorizer(stop_words="english")
+    tfidf_matrix = vectorizer.fit_transform(movies["content_text"])
+    similarity_matrix = cosine_similarity(tfidf_matrix)
 
     similarity_df = pd.DataFrame(
-        similarity,
-        index=user_movie_matrix.columns,
-        columns=user_movie_matrix.columns,
+        similarity_matrix,
+        index=movies["movieId"],
+        columns=movies["movieId"],
     )
+
     return similarity_df
 
 
-def predict_rating_item_item(user_id, movie_id, user_movie_matrix, item_similarity, global_mean):
-    if movie_id not in user_movie_matrix.columns:
-        return global_mean
+def find_movie_matches(query, movies, max_results=10):
+    query_clean = clean_title(query)
+    if not query_clean:
+        return pd.DataFrame()
 
-    if user_id not in user_movie_matrix.index:
-        return global_mean
+    contains_matches = movies[movies["clean_title"].str.contains(query_clean, na=False)].copy()
 
-    user_ratings = user_movie_matrix.loc[user_id].dropna()
-    if user_ratings.empty:
-        return global_mean
+    if len(contains_matches) >= max_results:
+        return contains_matches.head(max_results)
 
-    if movie_id not in item_similarity.index:
-        return global_mean
-
-    sims = item_similarity.loc[movie_id, user_ratings.index]
-    positive = sims[sims > 0]
-
-    if positive.empty:
-        return float(user_ratings.mean())
-
-    aligned_ratings = user_ratings[positive.index]
-    numerator = np.sum(positive.values * aligned_ratings.values)
-    denominator = np.sum(np.abs(positive.values))
-
-    if denominator == 0:
-        return float(user_ratings.mean())
-
-    pred = numerator / denominator
-    return float(np.clip(pred, 0.5, 5.0))
-
-
-def evaluate_item_item_cf(train, test):
-    user_movie_matrix = build_user_movie_matrix(train)
-    item_similarity = build_item_similarity_matrix(user_movie_matrix)
-    global_mean = train["rating"].mean()
-
-    preds = []
-    actuals = []
-
-    for row in test.itertuples(index=False):
-        pred = predict_rating_item_item(
-            row.userId,
-            row.movieId,
-            user_movie_matrix,
-            item_similarity,
-            global_mean,
-        )
-        preds.append(pred)
-        actuals.append(row.rating)
-
-    rmse = np.sqrt(mean_squared_error(actuals, preds))
-    return rmse, user_movie_matrix, item_similarity
-
-
-def get_top_popular_movies(train, movies, top_n=10):
-    summary = train.groupby("movieId").agg(
-        average_rating=("rating", "mean"),
-        rating_count=("rating", "count"),
+    movies = movies.copy()
+    movies["title_match_score"] = movies["clean_title"].apply(
+        lambda x: 1 if query_clean in x else 0
     )
 
-    summary = summary[summary["rating_count"] >= 30]
-    summary = summary.sort_values(
-        ["average_rating", "rating_count"],
-        ascending=[False, False],
+    starts_with_score = movies["clean_title"].apply(
+        lambda x: 1 if x.startswith(query_clean) else 0
     )
 
-    result = summary.head(top_n).reset_index()
-    result = result.merge(movies[["movieId", "title", "genres"]], on="movieId", how="left")
-    return result[["movieId", "title", "genres", "average_rating", "rating_count"]]
+    movies["starts_with_score"] = starts_with_score
+    movies["popularity_score"] = normalize_series(movies["rating_count"])
+    movies["rating_score"] = normalize_series(movies["avg_rating"])
+
+    ranked = movies.sort_values(
+        ["title_match_score", "starts_with_score", "rating_score", "popularity_score"],
+        ascending=[False, False, False, False],
+    )
+
+    ranked = ranked[ranked["title_match_score"] > 0]
+
+    if ranked.empty:
+        return contains_matches.head(max_results)
+
+    return ranked.head(max_results)
 
 
-def recommend_movies_for_user(
-    user_id,
-    train,
-    movies,
-    user_movie_matrix,
-    item_similarity,
-    top_n=10,
-    min_candidate_ratings=30,
-):
-    if user_id not in user_movie_matrix.index:
-        return pd.DataFrame(columns=["movieId", "title", "genres", "predicted_rating"])
+def collect_user_preferences(movies):
+    print("\nEnter a few movies you like.")
+    print("Type one movie title at a time. Press Enter on a blank line when done.\n")
 
-    rated_movies = set(train[train["userId"] == user_id]["movieId"].unique())
-    movie_counts = train["movieId"].value_counts()
+    selected = []
 
-    candidate_movies = [
-        movie_id
-        for movie_id in user_movie_matrix.columns
-        if movie_id not in rated_movies and movie_counts.get(movie_id, 0) >= min_candidate_ratings
-    ]
+    while True:
+        query = input("Movie title: ").strip()
+        if not query:
+            break
 
-    global_mean = train["rating"].mean()
-    recommendations = []
+        matches = find_movie_matches(query, movies)
 
-    for movie_id in candidate_movies:
-        pred = predict_rating_item_item(
-            user_id,
-            movie_id,
-            user_movie_matrix,
-            item_similarity,
-            global_mean,
+        if matches.empty:
+            print("No matches found. Try another title.\n")
+            continue
+
+        print("\nMatches:")
+        for i, row in enumerate(matches.itertuples(index=False), start=1):
+            print(
+                f"{i}. {row.title} [{row.genres}] "
+                f"(avg rating: {row.avg_rating:.2f}, ratings: {int(row.rating_count)})"
+            )
+
+        choice = input("Choose a number (or press Enter to skip): ").strip()
+        if not choice:
+            print()
+            continue
+
+        if not choice.isdigit():
+            print("Invalid choice.\n")
+            continue
+
+        choice_idx = int(choice) - 1
+        if choice_idx < 0 or choice_idx >= len(matches):
+            print("Invalid choice.\n")
+            continue
+
+        picked = matches.iloc[choice_idx]
+        rating_text = input(f"How much do you like '{picked['title']}'? (0.5 to 5.0): ").strip()
+
+        try:
+            rating = float(rating_text)
+        except ValueError:
+            print("Invalid rating. Using 5.0.\n")
+            rating = 5.0
+
+        rating = float(np.clip(rating, 0.5, 5.0))
+
+        selected.append(
+            {
+                "movieId": picked["movieId"],
+                "title": picked["title"],
+                "genres": picked["genres"],
+                "rating": rating,
+            }
         )
-        recommendations.append((movie_id, pred))
+        print()
 
-    rec_df = pd.DataFrame(recommendations, columns=["movieId", "predicted_rating"])
-    rec_df = rec_df.merge(movies[["movieId", "title", "genres"]], on="movieId", how="left")
-    rec_df = rec_df.sort_values("predicted_rating", ascending=False).head(top_n)
+    selected_df = pd.DataFrame(selected)
+    if selected_df.empty:
+        return selected_df
 
-    return rec_df[["movieId", "title", "genres", "predicted_rating"]]
-
-
-def summarize_user_profile(user_id, train, movies, top_n=5):
-    user_ratings = train[train["userId"] == user_id].copy()
-    if user_ratings.empty:
-        return pd.DataFrame(columns=["movieId", "title", "genres", "rating"])
-
-    favorites = user_ratings.sort_values("rating", ascending=False).head(top_n)
-    favorites = favorites.merge(movies[["movieId", "title", "genres"]], on="movieId", how="left")
-    return favorites[["movieId", "title", "genres", "rating"]]
+    return selected_df.drop_duplicates(subset=["movieId"], keep="last")
 
 
-def save_results(summary, popular_movies, favorite_movies, recommendations):
-    RESULTS_DIR.mkdir(exist_ok=True)
+def build_item_user_rating_data(ratings):
+    movie_user_matrix = ratings.pivot_table(
+        index="movieId",
+        columns="userId",
+        values="rating",
+    ).fillna(0)
 
-    with open(RESULTS_DIR / "summary.json", "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
+    collaborative_similarity = cosine_similarity(movie_user_matrix)
+    collaborative_similarity_df = pd.DataFrame(
+        collaborative_similarity,
+        index=movie_user_matrix.index,
+        columns=movie_user_matrix.index,
+    )
 
-    popular_movies.to_csv(RESULTS_DIR / "top_popular_movies.csv", index=False)
-    favorite_movies.to_csv(RESULTS_DIR / "sample_user_favorites.csv", index=False)
-    recommendations.to_csv(RESULTS_DIR / "sample_user_recommendations.csv", index=False)
+    return collaborative_similarity_df
+
+
+def score_movies(preferences, movies, content_similarity, collaborative_similarity):
+    selected_ids = preferences["movieId"].tolist()
+    selected_ratings = preferences.set_index("movieId")["rating"]
+
+    candidate_movies = movies[~movies["movieId"].isin(selected_ids)].copy()
+
+    content_scores = []
+    collaborative_scores = []
+
+    for movie_id in candidate_movies["movieId"]:
+        content_total = 0.0
+        collaborative_total = 0.0
+        weight_total = 0.0
+
+        for selected_id in selected_ids:
+            user_rating = selected_ratings[selected_id]
+            preference_weight = user_rating / 5.0
+
+            if (
+                movie_id in content_similarity.index
+                and selected_id in content_similarity.columns
+            ):
+                content_total += content_similarity.loc[movie_id, selected_id] * preference_weight
+
+            if (
+                movie_id in collaborative_similarity.index
+                and selected_id in collaborative_similarity.columns
+            ):
+                collaborative_total += collaborative_similarity.loc[movie_id, selected_id] * preference_weight
+
+            weight_total += preference_weight
+
+        if weight_total == 0:
+            content_scores.append(0.0)
+            collaborative_scores.append(0.0)
+        else:
+            content_scores.append(content_total / weight_total)
+            collaborative_scores.append(collaborative_total / weight_total)
+
+    candidate_movies["content_score"] = content_scores
+    candidate_movies["collaborative_score"] = collaborative_scores
+    candidate_movies["popularity_score"] = normalize_series(np.log1p(candidate_movies["rating_count"]))
+    candidate_movies["rating_score"] = normalize_series(candidate_movies["avg_rating"])
+
+    candidate_movies["final_score"] = (
+        0.35 * candidate_movies["content_score"]
+        + 0.35 * candidate_movies["collaborative_score"]
+        + 0.15 * candidate_movies["popularity_score"]
+        + 0.15 * candidate_movies["rating_score"]
+    )
+
+    return candidate_movies.sort_values("final_score", ascending=False)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train and evaluate a movie recommender.")
-    parser.add_argument("--user-id", type=int, default=None, help="User ID for sample recommendations.")
-    parser.add_argument("--top-n", type=int, default=10, help="Number of recommendations to display.")
-    parser.add_argument("--min-user-ratings", type=int, default=20, help="Minimum ratings per user.")
-    parser.add_argument("--min-movie-ratings", type=int, default=20, help="Minimum ratings per movie.")
-    args = parser.parse_args()
-
     ratings, movies = load_data()
+    movies = prepare_movies(movies, ratings)
 
     print(f"Loaded {len(ratings)} ratings and {len(movies)} movies.")
 
-    ratings = filter_data(
-        ratings,
-        min_user_ratings=args.min_user_ratings,
-        min_movie_ratings=args.min_movie_ratings,
-    )
+    content_similarity = build_similarity_data(movies)
+    collaborative_similarity = build_item_user_rating_data(ratings)
 
-    print(f"After filtering: {len(ratings)} ratings")
-    print(f"Users: {ratings['userId'].nunique()}")
-    print(f"Movies: {ratings['movieId'].nunique()}")
+    preferences = collect_user_preferences(movies)
 
-    train, test = train_test_split_ratings(ratings)
+    if preferences.empty:
+        print("\nNo movies were selected, so no recommendations were generated.")
+        return
 
-    print(f"Train size: {len(train)}")
-    print(f"Test size: {len(test)}")
+    print("\nYour selected movies:")
+    print(preferences[["title", "genres", "rating"]].to_string(index=False))
 
-    popularity_rmse, _, _ = evaluate_popularity_baseline(train, test)
-    print(f"\nPopularity baseline RMSE: {popularity_rmse:.4f}")
-
-    item_item_rmse, user_movie_matrix, item_similarity = evaluate_item_item_cf(train, test)
-    print(f"Item-item collaborative filtering RMSE: {item_item_rmse:.4f}")
-
-    sample_user = args.user_id if args.user_id is not None else int(train["userId"].iloc[0])
-
-    print(f"\nSample user: {sample_user}")
-    favorite_movies = summarize_user_profile(sample_user, train, movies, top_n=5)
-    if favorite_movies.empty:
-        print("No favorite-movie summary available for this user.")
-    else:
-        print("\nSample user's highest-rated movies:")
-        print(favorite_movies.to_string(index=False))
-
-    recommendations = recommend_movies_for_user(
-        sample_user,
-        train,
+    scored_movies = score_movies(
+        preferences,
         movies,
-        user_movie_matrix,
-        item_similarity,
-        top_n=args.top_n,
+        content_similarity,
+        collaborative_similarity,
     )
 
-    print(f"\nTop {args.top_n} recommendations for user {sample_user}:")
-    if recommendations.empty:
-        print("No recommendations available for this user.")
-    else:
-        print(recommendations.to_string(index=False))
+    recommendations = scored_movies[
+        [
+            "title",
+            "genres",
+            "avg_rating",
+            "rating_count",
+            "content_score",
+            "collaborative_score",
+            "final_score",
+        ]
+    ].head(10)
 
-    popular_movies = get_top_popular_movies(train, movies, top_n=10)
-
-    summary = {
-        "dataset": {
-            "ratings_count": int(len(ratings)),
-            "movies_count": int(ratings["movieId"].nunique()),
-            "users_count": int(ratings["userId"].nunique()),
-        },
-        "train_size": int(len(train)),
-        "test_size": int(len(test)),
-        "evaluation": {
-            "popularity_baseline_rmse": float(popularity_rmse),
-            "item_item_cf_rmse": float(item_item_rmse),
-        },
-        "sample_user_id": int(sample_user),
-    }
-
-    save_results(summary, popular_movies, favorite_movies, recommendations)
-    print(f"\nSaved result files to: {RESULTS_DIR}")
+    print("\nTop 10 recommendations based on your input:")
+    print(recommendations.to_string(index=False))
 
 
 if __name__ == "__main__":
