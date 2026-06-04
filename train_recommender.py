@@ -32,6 +32,12 @@ def clean_title(title):
     )
 
 
+def parse_genres(genre_text):
+    if pd.isna(genre_text) or genre_text == "(no genres listed)":
+        return set()
+    return {genre.strip() for genre in str(genre_text).split("|") if genre.strip()}
+
+
 def prepare_movies(movies, ratings):
     movies = movies.copy()
     movies["clean_title"] = movies["title"].apply(clean_title)
@@ -90,11 +96,10 @@ def find_movie_matches(query, movies, max_results=10):
         lambda x: 1 if query_clean in x else 0
     )
 
-    starts_with_score = movies["clean_title"].apply(
+    movies["starts_with_score"] = movies["clean_title"].apply(
         lambda x: 1 if x.startswith(query_clean) else 0
     )
 
-    movies["starts_with_score"] = starts_with_score
     movies["popularity_score"] = normalize_series(movies["rating_count"])
     movies["rating_score"] = normalize_series(movies["avg_rating"])
 
@@ -194,16 +199,54 @@ def build_item_user_rating_data(ratings):
     return collaborative_similarity_df
 
 
+def compute_genre_overlap_score(candidate_genres, selected_movie_rows, selected_ratings):
+    candidate_set = parse_genres(candidate_genres)
+    if not candidate_set:
+        return 0.0
+
+    weighted_overlap = 0.0
+    total_weight = 0.0
+
+    for row in selected_movie_rows.itertuples(index=False):
+        selected_set = parse_genres(row.genres)
+        if not selected_set:
+            continue
+
+        overlap = len(candidate_set.intersection(selected_set))
+        union = len(candidate_set.union(selected_set))
+        similarity = overlap / union if union > 0 else 0.0
+
+        weight = selected_ratings[row.movieId] / 5.0
+        weighted_overlap += similarity * weight
+        total_weight += weight
+
+    if total_weight == 0:
+        return 0.0
+
+    return weighted_overlap / total_weight
+
+
 def score_movies(preferences, movies, content_similarity, collaborative_similarity):
     selected_ids = preferences["movieId"].tolist()
     selected_ratings = preferences.set_index("movieId")["rating"]
+    selected_movie_rows = movies[movies["movieId"].isin(selected_ids)].copy()
 
     candidate_movies = movies[~movies["movieId"].isin(selected_ids)].copy()
 
+    genre_scores = []
     content_scores = []
     collaborative_scores = []
 
     for movie_id in candidate_movies["movieId"]:
+        candidate_row = candidate_movies[candidate_movies["movieId"] == movie_id].iloc[0]
+
+        genre_score = compute_genre_overlap_score(
+            candidate_row["genres"],
+            selected_movie_rows,
+            selected_ratings,
+        )
+        genre_scores.append(genre_score)
+
         content_total = 0.0
         collaborative_total = 0.0
         weight_total = 0.0
@@ -233,20 +276,54 @@ def score_movies(preferences, movies, content_similarity, collaborative_similari
             content_scores.append(content_total / weight_total)
             collaborative_scores.append(collaborative_total / weight_total)
 
+    candidate_movies["genre_score"] = genre_scores
     candidate_movies["content_score"] = content_scores
     candidate_movies["collaborative_score"] = collaborative_scores
     candidate_movies["popularity_score"] = normalize_series(np.log1p(candidate_movies["rating_count"]))
     candidate_movies["rating_score"] = normalize_series(candidate_movies["avg_rating"])
 
     candidate_movies["final_score"] = (
-        0.35 * candidate_movies["content_score"]
-        + 0.35 * candidate_movies["collaborative_score"]
-        + 0.15 * candidate_movies["popularity_score"]
-        + 0.15 * candidate_movies["rating_score"]
+        0.40 * candidate_movies["genre_score"]
+        + 0.25 * candidate_movies["content_score"]
+        + 0.20 * candidate_movies["collaborative_score"]
+        + 0.10 * candidate_movies["rating_score"]
+        + 0.05 * candidate_movies["popularity_score"]
     )
 
-    return candidate_movies.sort_values("final_score", ascending=False)
+    candidate_movies = candidate_movies[candidate_movies["genre_score"] > 0]
 
+    return candidate_movies.sort_values(
+        ["final_score", "genre_score", "content_score"],
+        ascending=False,
+    )
+
+
+def find_hidden_gems(scored_movies):
+    gems = scored_movies.copy()
+
+    if selected_ids is not None:
+        gems = gems[~gems["movieId"].isin(selected_ids)].copy()
+
+    gems = gems[gems["genre_score"] > 0.15]
+    gems = gems[gems["rating_count"] >= 5]
+    gems = gems[gems["rating_count"] <= 50]
+
+    gems["low_popularity_score"] = 1 - gems["popularity_score"]
+
+    gems["hidden_gem_score"] = (
+        0.45 * gems["genre_score"]
+        + 0.25 * gems["content_score"]
+        + 0.15 * gems["collaborative_score"]
+        + 0.05 * gems["rating_score"]
+        + 0.10 * gems["low_popularity_score"]
+    )
+
+    gems = gems.sort_values(
+        ["hidden_gem_score", "genre_score", "content_score"],
+        ascending=False,
+    )
+
+    return gems
 
 def main():
     ratings, movies = load_data()
@@ -273,21 +350,53 @@ def main():
         collaborative_similarity,
     )
 
+    selected_ids = set(preferences["movieId"].tolist())
+
+    scored_movies = scored_movies[~scored_movies["movieId"].isin(selected_ids)].copy()
+
     recommendations = scored_movies[
         [
+            "movieId",
             "title",
             "genres",
             "avg_rating",
             "rating_count",
+            "genre_score",
             "content_score",
             "collaborative_score",
             "final_score",
         ]
     ].head(10)
 
+    hidden_gems_source = find_hidden_gems(scored_movies)
+    hidden_gems_source = hidden_gems_source[
+        ~hidden_gems_source["movieId"].isin(selected_ids)
+    ].copy()
+
+    hidden_gems = hidden_gems_source[
+        [
+            "movieId",
+            "title",
+            "genres",
+            "avg_rating",
+            "rating_count",
+            "genre_score",
+            "content_score",
+            "collaborative_score",
+            "hidden_gem_score",
+        ]
+    ].head(5)
+
     print("\nTop 10 recommendations based on your input:")
-    print(recommendations.to_string(index=False))
+    if recommendations.empty:
+        print("No recommendations found.")
+    else:
+        print(recommendations.drop(columns=["movieId"]).to_string(index=False))
 
-
+    print("\n5 hidden gems matching your tastes:")
+    if hidden_gems.empty:
+        print("No hidden gems found with the current filters.")
+    else:
+        print(hidden_gems.drop(columns=["movieId"]).to_string(index=False))
 if __name__ == "__main__":
     main()
