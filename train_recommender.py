@@ -301,9 +301,6 @@ def score_movies(preferences, movies, content_similarity, collaborative_similari
 def find_hidden_gems(scored_movies):
     gems = scored_movies.copy()
 
-    if selected_ids is not None:
-        gems = gems[~gems["movieId"].isin(selected_ids)].copy()
-
     gems = gems[gems["genre_score"] > 0.15]
     gems = gems[gems["rating_count"] >= 5]
     gems = gems[gems["rating_count"] <= 50]
